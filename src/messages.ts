@@ -14,41 +14,41 @@ export interface BaseMessage {
 // ---------- Discriminated Union for Message Payloads ----------
 
 export interface TextOnlyMessage extends BaseMessage {
-  messageType: 'text';
+  messageType: "text";
   /** The text content of the message. Mandatory for plain text messages. */
   text: string;
 }
 
 export interface ImageUrlMessage extends BaseMessage {
-  messageType: 'image';
+  messageType: "image";
   /** URL of the image to send. Supported: JPEG, PNG. Max size: 5MB. */
   imageUrl: string;
   // `text` (caption) is optional for image messages
 }
 
 export interface VideoUrlMessage extends BaseMessage {
-  messageType: 'video';
+  messageType: "video";
   /** URL of the video to send. Supported: MP4, 3GPP. Max size: 16MB. */
   videoUrl: string;
   // `text` (caption) is optional for video messages
 }
 
 export interface DocumentUrlMessage extends BaseMessage {
-  messageType: 'document';
+  messageType: "document";
   /** URL of the document to send. Supports PDF, DOCX, XLSX, etc. Max size: 100MB. */
   documentUrl: string;
   // `text` (caption) is optional for document messages
 }
 
 export interface AudioUrlMessage extends BaseMessage {
-  messageType: 'audio';
+  messageType: "audio";
   /** URL of the audio file to send (sent as voice note). Supported: AAC, MP3, OGG, AMR. Max size: 16MB. */
   audioUrl: string;
   // `text` is typically not used with audioUrl (voice notes) but allowed by API
 }
 
 export interface StickerUrlMessage extends BaseMessage {
-  messageType: 'sticker';
+  messageType: "sticker";
   /** URL of the sticker (.webp) to send. Max size: 100KB. */
   stickerUrl: string;
   // `text` is not applicable to sticker messages
@@ -63,7 +63,7 @@ export interface ContactCardPayload {
 }
 
 export interface ContactCardMessage extends BaseMessage {
-  messageType: 'contact';
+  messageType: "contact";
   /** Contact card object. */
   contact: ContactCardPayload;
   // `text` (caption) is optional
@@ -81,7 +81,7 @@ export interface LocationPinPayload {
 }
 
 export interface LocationPinMessage extends BaseMessage {
-  messageType: 'location';
+  messageType: "location";
   /** Location object. */
   location: LocationPinPayload;
   // `text` (caption) is optional
@@ -111,7 +111,6 @@ export type LocationMessage = LocationPinMessage;
 export type ContactCard = ContactCardPayload;
 export type LocationPin = LocationPinPayload;
 
-
 // ---------- API Success Response & Rate Limit Types ----------
 
 /** Standard API success response structure. */
@@ -128,7 +127,7 @@ export interface RateLimitInfo {
   remaining: number | null;
   /** Unix timestamp (in seconds) when the window resets (from X-RateLimit-Reset). */
   resetTimestamp: number | null;
-  /** 
+  /**
    * Optional helper to get the reset timestamp as a Date object.
    * @returns A Date object if resetTimestamp is available, otherwise null.
    */
@@ -139,5 +138,15 @@ export interface RateLimitInfo {
 export interface WasenderSendResult {
   response: WasenderSuccessResponse;
   /** Optional. Rate limit information from the API response. May be undefined if not applicable or not provided by the server. */
+  rateLimit?: RateLimitInfo;
+}
+
+// ---------- Message Management Result Types ----------
+export interface MessageInfoResponse extends WasenderSuccessResponse {
+  data: any; // Keep flexible; API returns message info object
+}
+
+export interface MessageInfoResult {
+  response: MessageInfoResponse;
   rateLimit?: RateLimitInfo;
 }

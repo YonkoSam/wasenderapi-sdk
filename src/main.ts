@@ -6,22 +6,32 @@
 
 import {
   WasenderMessagePayload, // Discriminated union
-  TextOnlyMessage, ImageUrlMessage, VideoUrlMessage, DocumentUrlMessage, AudioUrlMessage, StickerUrlMessage, ContactCardMessage, LocationPinMessage, // Specific payload types for existing methods
+  TextOnlyMessage,
+  ImageUrlMessage,
+  VideoUrlMessage,
+  DocumentUrlMessage,
+  AudioUrlMessage,
+  StickerUrlMessage,
+  ContactCardMessage,
+  LocationPinMessage, // Specific payload types for existing methods
   WasenderSuccessResponse,
   RateLimitInfo,
-  WasenderSendResult
+  WasenderSendResult,
+  MessageInfoResponse,
+  MessageInfoResult,
 } from "./messages.ts";
 
 import {
   WasenderAPIError,
   WasenderErrorResponse,
-  WasenderAPIRawResponse
+  WasenderAPIRawResponse,
 } from "./errors.ts";
 
 import {
-    WEBHOOK_SIGNATURE_HEADER,
-    verifyWasenderWebhookSignature,
-    WasenderWebhookEvent
+  WEBHOOK_SIGNATURE_HEADER,
+  verifyWasenderWebhookSignature,
+  WasenderWebhookEvent,
+  dispatchWebhookEvent,
 } from "./webhook.ts";
 
 import {
@@ -32,7 +42,7 @@ import {
   GetAllContactsResponse,
   GetContactInfoResponse,
   GetContactProfilePictureResponse,
-  ContactActionResponse
+  ContactActionResponse,
 } from "./contacts.ts"; // Added imports for contact types
 import {
   GetAllGroupsResult,
@@ -46,7 +56,7 @@ import {
   ModifyGroupParticipantsResponse,
   ModifyGroupParticipantsPayload,
   UpdateGroupSettingsPayload,
-  UpdateGroupSettingsResponse
+  UpdateGroupSettingsResponse,
 } from "./groups.ts"; // Added imports for group types
 import {
   WhatsAppSession, // Keep if used directly, otherwise covered by result types
@@ -72,7 +82,7 @@ import {
   GetQRCodeResponse,
   DisconnectSessionResponse,
   RegenerateApiKeyResponse,
-  GetSessionStatusResponse
+  GetSessionStatusResponse,
 } from "./sessions.ts"; // Added imports for session types
 
 const SDK_VERSION = "0.1.0";
@@ -114,26 +124,30 @@ export class Wasender {
   constructor(
     apiKey: string | undefined,
     personalAccessToken?: string,
-    baseUrl: string = "https://www.wasenderapi.com/api", 
+    baseUrl: string = "https://www.wasenderapi.com/api",
     fetchImplementation?: FetchImplementation,
     retryOptions?: RetryConfig,
     webhookSecret?: string
   ) {
     if (apiKey === undefined && personalAccessToken === undefined) {
-      throw new Error("Either an API Key (for session operations) or a Personal Access Token (for session management) must be provided to initialize the Wasender SDK.");
+      throw new Error(
+        "Either an API Key (for session operations) or a Personal Access Token (for session management) must be provided to initialize the Wasender SDK."
+      );
     }
     this.apiKey = apiKey;
     this.personalAccessToken = personalAccessToken;
     this.baseUrl = baseUrl.replace(/\/$/, ""); // Ensure no trailing slash
     this.fetchImpl = fetchImplementation || globalThis.fetch;
     this.retryConfig = {
-        enabled: retryOptions?.enabled ?? false,
-        maxRetries: retryOptions?.maxRetries ?? 0,
+      enabled: retryOptions?.enabled ?? false,
+      maxRetries: retryOptions?.maxRetries ?? 0,
     };
     this.configuredWebhookSecret = webhookSecret;
 
     if (!this.fetchImpl) {
-        throw new Error("Fetch implementation is not available. Please provide one (e.g., for Node.js < 18 by polyfilling globalThis.fetch or passing a custom fetch)." );
+      throw new Error(
+        "Fetch implementation is not available. Please provide one (e.g., for Node.js < 18 by polyfilling globalThis.fetch or passing a custom fetch)."
+      );
     }
   }
 
@@ -148,53 +162,87 @@ export class Wasender {
       limit: limit ? parseInt(limit, 10) : null,
       remaining: remaining ? parseInt(remaining, 10) : null,
       resetTimestamp: resetTimestampNum,
-      getResetTimestampAsDate: () => resetTimestampNum ? new Date(resetTimestampNum * 1000) : null,
+      getResetTimestampAsDate: () =>
+        resetTimestampNum ? new Date(resetTimestampNum * 1000) : null,
     };
   }
 
   // General purpose request helper
-  private async request<TResponse extends WasenderSuccessResponse | GetSessionStatusResponse | RegenerateApiKeyResponse >(
+  private async request<
+    TResponse extends
+      | WasenderSuccessResponse
+      | GetSessionStatusResponse
+      | RegenerateApiKeyResponse
+  >(
     method: "GET" | "POST" | "PUT" | "DELETE",
     path: string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    body?: Record<string, any> | null
+    body?: Record<string, any> | null,
+    // small options bag for special cases (e.g., force API Key usage or raw body send)
+    options?: { forceUseApiKey?: boolean; rawBody?: boolean }
   ): Promise<{ response: TResponse; rateLimit: RateLimitInfo }> {
     const url = `${this.baseUrl}${path}`;
 
     // Determine which token to use
-    const isSessionManagementPath = path.startsWith("/whatsapp-sessions") || path === "/status";
+    const isSessionManagementPath = path.startsWith("/whatsapp-sessions");
+    const isStatusPath = path === "/status";
+    const isUserPath = path === "/user";
     let tokenToUse: string | undefined;
 
-    if (isSessionManagementPath) {
+    // If caller explicitly forces API key usage, prefer that
+    if (options?.forceUseApiKey) {
+      if (!this.apiKey)
+        throw new WasenderAPIError(
+          "API Key required for this operation but not provided.",
+          401
+        );
+      tokenToUse = this.apiKey;
+    } else if (isSessionManagementPath) {
       if (!this.personalAccessToken) {
-        throw new WasenderAPIError("Personal Access Token is required for this operation but was not provided during SDK initialization.", 401);
+        throw new WasenderAPIError(
+          "Personal Access Token is required for this operation but was not provided during SDK initialization.",
+          401
+        );
       }
       tokenToUse = this.personalAccessToken;
+    } else if (isStatusPath || isUserPath) {
+      // session status and /user must use API key
+      if (!this.apiKey)
+        throw new WasenderAPIError(
+          "API Key required for this operation but not provided.",
+          401
+        );
+      tokenToUse = this.apiKey;
     } else {
       if (!this.apiKey) {
-        // If apiKey is generally required for non-session-management paths but not provided.
-        // This could happen if SDK was initialized only with PAT for session management
-        // and then an attempt is made to call, e.g., send-message.
-        throw new WasenderAPIError("Session API Key is required for this operation but was not provided or is not applicable.", 401);
+        throw new WasenderAPIError(
+          "Session API Key is required for this operation but was not provided or is not applicable.",
+          401
+        );
       }
       tokenToUse = this.apiKey;
     }
 
     const requestHeaders: HeadersInit = {
-      "Authorization": `Bearer ${tokenToUse}`,
-      "Accept": "application/json",
-      "User-Agent": `wasender-typescript-sdk/${SDK_VERSION}`
+      Authorization: `Bearer ${tokenToUse}`,
+      Accept: "application/json",
+      "User-Agent": `wasender-typescript-sdk/${SDK_VERSION}`,
     };
 
     let processedBody = body ? { ...body } : null;
 
     // Runtime casting for LocationPinMessage latitude/longitude if they are strings
-    if (processedBody && typeof processedBody === 'object' && 'messageType' in processedBody && processedBody.messageType === 'location') {
+    if (
+      processedBody &&
+      typeof processedBody === "object" &&
+      "messageType" in processedBody &&
+      processedBody.messageType === "location"
+    ) {
       const locationPayload = (processedBody as any).location;
-      if (locationPayload && typeof locationPayload.latitude === 'string') {
+      if (locationPayload && typeof locationPayload.latitude === "string") {
         locationPayload.latitude = parseFloat(locationPayload.latitude);
       }
-      if (locationPayload && typeof locationPayload.longitude === 'string') {
+      if (locationPayload && typeof locationPayload.longitude === "string") {
         locationPayload.longitude = parseFloat(locationPayload.longitude);
       }
     }
@@ -204,12 +252,17 @@ export class Wasender {
       headers: requestHeaders,
     };
 
-    if ((method === "POST" || method === "PUT") && processedBody) {
+    if (
+      (method === "POST" || method === "PUT") &&
+      processedBody &&
+      !options?.rawBody
+    ) {
       requestHeaders["Content-Type"] = "application/json";
       requestOptions.body = JSON.stringify(processedBody);
-    } else if (method === "POST" || method === "PUT") { // Body is null or not provided but method requires a body
-        requestHeaders["Content-Type"] = "application/json";
-        requestOptions.body = JSON.stringify({}); 
+    } else if ((method === "POST" || method === "PUT") && !options?.rawBody) {
+      // Body is null or not provided but method requires a body
+      requestHeaders["Content-Type"] = "application/json";
+      requestOptions.body = JSON.stringify({});
     } else if (method === "DELETE") {
       // No specific body handling for DELETE based on current API structure
     }
@@ -229,70 +282,113 @@ export class Wasender {
           networkError instanceof Error
             ? new WasenderAPIError(
                 `Network error: ${networkError.message}`,
-                undefined, undefined, undefined, rateLimitInfo
+                undefined,
+                undefined,
+                undefined,
+                rateLimitInfo
               )
             : new WasenderAPIError(
                 "An unknown network error occurred during the request.",
-                undefined, undefined, undefined, rateLimitInfo
+                undefined,
+                undefined,
+                undefined,
+                rateLimitInfo
               );
 
-        if (attempts > this.retryConfig.maxRetries || !this.retryConfig.enabled) {
+        if (
+          attempts > this.retryConfig.maxRetries ||
+          !this.retryConfig.enabled
+        ) {
           throw errorToThrow;
         }
         if (attempts > 1 && method === "GET") throw errorToThrow;
         console.warn(
           `Wasender SDK: Network error on attempt ${attempts} for ${method} ${path}. Retrying if configured...`
         );
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempts));
         continue;
       }
 
-      let responseBody: WasenderAPIRawResponse | RegenerateApiKeyResponse | GetSessionStatusResponse;
+      let responseBody:
+        | WasenderAPIRawResponse
+        | RegenerateApiKeyResponse
+        | GetSessionStatusResponse;
       try {
         if (httpResponse.status === 204) {
-            if (path.includes("/block") || path.includes("/unblock")) {
-                 responseBody = { success: true, data: { message: path.includes("/block") ? "Contact blocked" : "Contact unblocked" } } as unknown as WasenderAPIRawResponse;
-            } else if (method === "DELETE" && path.startsWith("/whatsapp-sessions/")) {
-                 responseBody = { success: true, data: null } as unknown as WasenderAPIRawResponse;
-            } else {
-                 responseBody = { success: true } as WasenderAPIRawResponse; // Default for 204
-            }
+          if (path.includes("/block") || path.includes("/unblock")) {
+            responseBody = {
+              success: true,
+              data: {
+                message: path.includes("/block")
+                  ? "Contact blocked"
+                  : "Contact unblocked",
+              },
+            } as unknown as WasenderAPIRawResponse;
+          } else if (
+            method === "DELETE" &&
+            path.startsWith("/whatsapp-sessions/")
+          ) {
+            responseBody = {
+              success: true,
+              data: null,
+            } as unknown as WasenderAPIRawResponse;
+          } else {
+            responseBody = { success: true } as WasenderAPIRawResponse; // Default for 204
+          }
         } else {
-            // For /status, the response is directly {status: "..."}
-            // For /regenerate-key, response is {success: true, api_key: "..."}
-            // For others, it's WasenderAPIRawResponse
-            if (path === "/status") {
-                responseBody = await httpResponse.json() as GetSessionStatusResponse;
-            } else if (path.includes("/regenerate-key")) {
-                responseBody = await httpResponse.json() as RegenerateApiKeyResponse;
-            } else {
-                responseBody = (await httpResponse.json()) as WasenderAPIRawResponse;
-            }
+          // For /status, the response is directly {status: "..."}
+          // For /regenerate-key, response is {success: true, api_key: "..."}
+          // For others, it's WasenderAPIRawResponse
+          if (path === "/status") {
+            responseBody =
+              (await httpResponse.json()) as GetSessionStatusResponse;
+          } else if (path.includes("/regenerate-key")) {
+            responseBody =
+              (await httpResponse.json()) as RegenerateApiKeyResponse;
+          } else {
+            responseBody =
+              (await httpResponse.json()) as WasenderAPIRawResponse;
+          }
         }
       } catch (parseError) {
-        const errorText = await httpResponse.text().catch(() => "Could not retrieve error text.");
+        const errorText = await httpResponse
+          .text()
+          .catch(() => "Could not retrieve error text.");
         throw new WasenderAPIError(
           `Failed to parse API response (Status ${httpResponse.status}): ${errorText}`,
-          httpResponse.status, undefined, undefined, rateLimitInfo
+          httpResponse.status,
+          undefined,
+          undefined,
+          rateLimitInfo
         );
       }
-      
-      if (path === '/status' && httpResponse.ok) {
-         return {
-            response: responseBody as TResponse, 
-            rateLimit: rateLimitInfo!, 
-        };
-      }
-      
-      if (path.includes('/regenerate-key') && 'api_key' in responseBody && responseBody.success === true) {
+
+      if (path === "/status" && httpResponse.ok) {
         return {
-            response: responseBody as TResponse, 
-            rateLimit: rateLimitInfo!,
+          response: responseBody as TResponse,
+          rateLimit: rateLimitInfo!,
         };
       }
 
-      if (!httpResponse.ok || (responseBody && 'success' in responseBody && typeof responseBody.success === 'boolean' && !responseBody.success)) {
-        const apiError = responseBody as WasenderErrorResponse; 
+      if (
+        path.includes("/regenerate-key") &&
+        "api_key" in responseBody &&
+        responseBody.success === true
+      ) {
+        return {
+          response: responseBody as TResponse,
+          rateLimit: rateLimitInfo!,
+        };
+      }
+
+      if (
+        !httpResponse.ok ||
+        (responseBody &&
+          "success" in responseBody &&
+          typeof responseBody.success === "boolean" &&
+          !responseBody.success)
+      ) {
+        const apiError = responseBody as WasenderErrorResponse;
         const errorToThrow = new WasenderAPIError(
           apiError.message || "API request failed with an unspecified error.",
           httpResponse.status,
@@ -311,25 +407,30 @@ export class Wasender {
           console.warn(
             `Wasender SDK: Rate limit (429) on attempt ${attempts} for ${method} ${path}. Retrying after ${errorToThrow.retryAfter}s...`
           );
-          await new Promise(resolve => setTimeout(resolve, errorToThrow.retryAfter! * 1000));
-          continue; 
+          await new Promise((resolve) =>
+            setTimeout(resolve, errorToThrow.retryAfter! * 1000)
+          );
+          continue;
         } else {
-          throw errorToThrow; 
+          throw errorToThrow;
         }
       }
-      
+
       // This is the general success case for standard responses
-      if ('success' in responseBody && responseBody.success === true) {
+      if ("success" in responseBody && responseBody.success === true) {
         return {
           response: responseBody as TResponse,
           rateLimit: rateLimitInfo!,
         };
       }
-      
+
       // Fallback for unexpected response structures that didn't throw an error but aren't recognized success
       throw new WasenderAPIError(
         `Unexpected API response structure from ${method} ${path}. Status: ${httpResponse.status}`,
-        httpResponse.status, undefined, undefined, rateLimitInfo
+        httpResponse.status,
+        undefined,
+        undefined,
+        rateLimitInfo
       );
     } // End of while(true)
   } // End of request method
@@ -344,12 +445,12 @@ export class Wasender {
   ): Promise<{ response: TSuccessResponse; rateLimit: RateLimitInfo }> {
     // Remove messageType if present, as it was specific to send-message
     const apiPayload = payload ? { ...payload } : null;
-    if (apiPayload && 'messageType' in apiPayload) {
+    if (apiPayload && "messageType" in apiPayload) {
       delete apiPayload.messageType;
     }
     return this.request<TSuccessResponse>("POST", path, apiPayload);
   }
-  
+
   // General purpose GET
   private async getInternal<TSuccessResponse extends WasenderSuccessResponse>(
     path: string
@@ -369,7 +470,9 @@ export class Wasender {
   }
 
   // General purpose DELETE
-  private async deleteInternal<TSuccessResponse extends WasenderSuccessResponse>(
+  private async deleteInternal<
+    TSuccessResponse extends WasenderSuccessResponse
+  >(
     path: string
   ): Promise<{ response: TSuccessResponse; rateLimit: RateLimitInfo }> {
     return this.request<TSuccessResponse>("DELETE", path);
@@ -382,45 +485,224 @@ export class Wasender {
    * @returns A promise that resolves to the API response and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async send<T extends WasenderMessagePayload>(payload: T): Promise<WasenderSendResult> {
+  public async send<T extends WasenderMessagePayload>(
+    payload: T
+  ): Promise<WasenderSendResult> {
     // The /send-message path is specific to this method
     const { messageType, ...apiPayload } = payload;
-    return this.postInternal<typeof apiPayload, WasenderSuccessResponse>("/send-message", apiPayload) as Promise<WasenderSendResult>;
+    return this.postInternal<typeof apiPayload, WasenderSuccessResponse>(
+      "/send-message",
+      apiPayload
+    ) as Promise<WasenderSendResult>;
   }
 
   // ---------- Specific Endpoint Helpers (Wrappers for the generic send) ----------
   // These now add the `messageType` discriminant before calling the generic send.
 
-  sendText(payload: Omit<TextOnlyMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'text' });
+  sendText(
+    payload: Omit<TextOnlyMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "text" });
   }
 
-  sendImage(payload: Omit<ImageUrlMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'image' });
+  sendImage(
+    payload: Omit<ImageUrlMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "image" });
   }
 
-  sendVideo(payload: Omit<VideoUrlMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'video' });
+  sendVideo(
+    payload: Omit<VideoUrlMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "video" });
   }
 
-  sendDocument(payload: Omit<DocumentUrlMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'document' });
+  sendDocument(
+    payload: Omit<DocumentUrlMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "document" });
   }
 
-  sendAudio(payload: Omit<AudioUrlMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'audio' });
+  sendAudio(
+    payload: Omit<AudioUrlMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "audio" });
   }
 
-  sendSticker(payload: Omit<StickerUrlMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'sticker' });
+  sendSticker(
+    payload: Omit<StickerUrlMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "sticker" });
   }
 
-  sendContact(payload: Omit<ContactCardMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'contact' });
+  sendContact(
+    payload: Omit<ContactCardMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "contact" });
   }
 
-  sendLocation(payload: Omit<LocationPinMessage, 'messageType'>): Promise<WasenderSendResult> {
-    return this.send({ ...payload, messageType: 'location' });
+  sendLocation(
+    payload: Omit<LocationPinMessage, "messageType">
+  ): Promise<WasenderSendResult> {
+    return this.send({ ...payload, messageType: "location" });
+  }
+
+  // ---------- New Messaging Utilities ----------
+  /**
+   * Sends a group message that includes mentions.
+   */
+  public async sendMessageWithMentions(
+    to: string,
+    text: string,
+    mentions: string[]
+  ): Promise<WasenderSendResult> {
+    if (!to) throw new WasenderAPIError("Recipient (to) is required.", 400);
+    if (!to.endsWith("@g.us"))
+      throw new WasenderAPIError(
+        "'to' must be a group JID ending with @g.us for mentions.",
+        400
+      );
+    if (!text || text.trim().length === 0)
+      throw new WasenderAPIError("text is required and cannot be empty.", 400);
+    if (!mentions || mentions.length === 0)
+      throw new WasenderAPIError(
+        "mentions array is required and must contain at least one JID.",
+        400
+      );
+
+    const payload = { to, text, mentions };
+    return this.postInternal<typeof payload, WasenderSuccessResponse>(
+      "/send-message",
+      payload
+    ) as Promise<WasenderSendResult>;
+  }
+
+  /**
+   * Sends a quoted message (reply). Accepts replyTo msgId and optional media/contact/location fields.
+   */
+  public async sendQuotedMessage(payload: {
+    to: string;
+    text?: string;
+    replyTo?: number;
+    imageUrl?: string;
+    videoUrl?: string;
+    documentUrl?: string;
+    audioUrl?: string;
+    stickerUrl?: string;
+    contact?: any;
+    location?: any;
+  }): Promise<WasenderSendResult> {
+    if (!payload?.to)
+      throw new WasenderAPIError("Recipient (to) is required.", 400);
+    if (
+      payload.replyTo !== undefined &&
+      (!Number.isInteger(payload.replyTo) || payload.replyTo <= 0)
+    ) {
+      throw new WasenderAPIError(
+        "replyTo must be a positive integer when provided.",
+        400
+      );
+    }
+    // Ensure there is at least some content
+    if (
+      !payload.text &&
+      !payload.imageUrl &&
+      !payload.videoUrl &&
+      !payload.documentUrl &&
+      !payload.audioUrl &&
+      !payload.stickerUrl &&
+      !payload.contact &&
+      !payload.location
+    ) {
+      throw new WasenderAPIError(
+        "At least one of text or a media/contact/location field must be provided.",
+        400
+      );
+    }
+
+    // POST to same endpoint with replyTo included
+    return this.postInternal<typeof payload, WasenderSuccessResponse>(
+      "/send-message",
+      payload
+    ) as Promise<WasenderSendResult>;
+  }
+
+  /**
+   * Edit a previously sent message's text.
+   */
+  public async editMessage(
+    msgId: number,
+    text: string
+  ): Promise<WasenderSendResult> {
+    if (!msgId || !Number.isInteger(msgId) || msgId <= 0)
+      throw new WasenderAPIError("msgId must be a positive integer.", 400);
+    if (!text || text.trim().length === 0)
+      throw new WasenderAPIError("text is required and cannot be empty.", 400);
+    return this.putInternal<{ text: string }, WasenderSuccessResponse>(
+      `/messages/${msgId}`,
+      { text }
+    );
+  }
+
+  /**
+   * Delete a message by ID.
+   */
+  public async deleteMessage(msgId: number): Promise<WasenderSendResult> {
+    if (!msgId || !Number.isInteger(msgId) || msgId <= 0)
+      throw new WasenderAPIError("msgId must be a positive integer.", 400);
+    return this.deleteInternal<WasenderSuccessResponse>(`/messages/${msgId}`);
+  }
+
+  /**
+   * Retrieve message info by ID.
+   */
+  public async getMessageInfo(msgId: number): Promise<MessageInfoResult> {
+    if (!msgId || !Number.isInteger(msgId) || msgId <= 0)
+      throw new WasenderAPIError("msgId must be a positive integer.", 400);
+    return this.getInternal<MessageInfoResponse>(`/messages/${msgId}/info`);
+  }
+
+  // ---------- Presence & Utility ----------
+  /**
+   * Send a presence update to a specific JID.
+   */
+  public async sendPresenceUpdate(
+    jid: string,
+    type: "composing" | "recording" | "available" | "unavailable",
+    delayMs?: number
+  ): Promise<WasenderSendResult> {
+    const allowed = ["composing", "recording", "available", "unavailable"];
+    if (!jid) throw new WasenderAPIError("jid is required.", 400);
+    if (!allowed.includes(type))
+      throw new WasenderAPIError(
+        `type must be one of: ${allowed.join(", ")}`,
+        400
+      );
+    if (delayMs !== undefined && (typeof delayMs !== "number" || delayMs < 0))
+      throw new WasenderAPIError(
+        "delayMs must be a non-negative number when provided.",
+        400
+      );
+
+    const payload: any = { jid, type };
+    if (delayMs !== undefined) payload.delayMs = delayMs;
+    return this.postInternal<typeof payload, WasenderSuccessResponse>(
+      "/send-presence-update",
+      payload
+    ) as Promise<WasenderSendResult>;
+  }
+
+  /**
+   * Check if a phone number is on WhatsApp.
+   */
+  public async checkIfOnWhatsapp(
+    phoneNumber: string
+  ): Promise<WasenderSendResult> {
+    if (!phoneNumber)
+      throw new WasenderAPIError("phoneNumber is required.", 400);
+    return this.getInternal<WasenderSuccessResponse>(
+      `/on-whatsapp/${encodeURIComponent(phoneNumber)}`
+    ) as Promise<WasenderSendResult>;
   }
 
   // ---------- Contact Management Methods ----------
@@ -440,11 +722,18 @@ export class Wasender {
    * @returns A promise that resolves to the contact information and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async getContactInfo(contactPhoneNumber: string): Promise<GetContactInfoResult> {
+  public async getContactInfo(
+    contactPhoneNumber: string
+  ): Promise<GetContactInfoResult> {
     if (!contactPhoneNumber) {
-      throw new WasenderAPIError("Contact phone number (JID) is required.", 400);
+      throw new WasenderAPIError(
+        "Contact phone number (JID) is required.",
+        400
+      );
     }
-    return this.getInternal<GetContactInfoResponse>(`/contacts/${contactPhoneNumber}`);
+    return this.getInternal<GetContactInfoResponse>(
+      `/contacts/${contactPhoneNumber}`
+    );
   }
 
   /**
@@ -453,11 +742,18 @@ export class Wasender {
    * @returns A promise that resolves to the profile picture URL and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async getContactProfilePicture(contactPhoneNumber: string): Promise<GetContactProfilePictureResult> {
+  public async getContactProfilePicture(
+    contactPhoneNumber: string
+  ): Promise<GetContactProfilePictureResult> {
     if (!contactPhoneNumber) {
-      throw new WasenderAPIError("Contact phone number (JID) is required.", 400);
+      throw new WasenderAPIError(
+        "Contact phone number (JID) is required.",
+        400
+      );
     }
-    return this.getInternal<GetContactProfilePictureResponse>(`/contacts/${contactPhoneNumber}/picture`);
+    return this.getInternal<GetContactProfilePictureResponse>(
+      `/contacts/${contactPhoneNumber}/picture`
+    );
   }
 
   /**
@@ -466,12 +762,20 @@ export class Wasender {
    * @returns A promise that resolves to the action status and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async blockContact(contactPhoneNumber: string): Promise<ContactActionResult> {
+  public async blockContact(
+    contactPhoneNumber: string
+  ): Promise<ContactActionResult> {
     if (!contactPhoneNumber) {
-      throw new WasenderAPIError("Contact phone number (JID) is required.", 400);
+      throw new WasenderAPIError(
+        "Contact phone number (JID) is required.",
+        400
+      );
     }
     // POST request, potentially with no body or an empty JSON body
-    return this.postInternal<null, ContactActionResponse>(`/contacts/${contactPhoneNumber}/block`, null);
+    return this.postInternal<null, ContactActionResponse>(
+      `/contacts/${contactPhoneNumber}/block`,
+      null
+    );
   }
 
   /**
@@ -480,12 +784,20 @@ export class Wasender {
    * @returns A promise that resolves to the action status and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async unblockContact(contactPhoneNumber: string): Promise<ContactActionResult> {
+  public async unblockContact(
+    contactPhoneNumber: string
+  ): Promise<ContactActionResult> {
     if (!contactPhoneNumber) {
-      throw new WasenderAPIError("Contact phone number (JID) is required.", 400);
+      throw new WasenderAPIError(
+        "Contact phone number (JID) is required.",
+        400
+      );
     }
     // POST request, potentially with no body or an empty JSON body
-    return this.postInternal<null, ContactActionResponse>(`/contacts/${contactPhoneNumber}/unblock`, null);
+    return this.postInternal<null, ContactActionResponse>(
+      `/contacts/${contactPhoneNumber}/unblock`,
+      null
+    );
   }
 
   // ---------- Group Management Methods ----------
@@ -505,11 +817,15 @@ export class Wasender {
    * @returns A promise that resolves to the group metadata and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async getGroupMetadata(groupJid: string): Promise<GetGroupMetadataResult> {
+  public async getGroupMetadata(
+    groupJid: string
+  ): Promise<GetGroupMetadataResult> {
     if (!groupJid) {
       throw new WasenderAPIError("Group JID is required.", 400);
     }
-    return this.getInternal<GetGroupMetadataResponse>(`/groups/${groupJid}/metadata`);
+    return this.getInternal<GetGroupMetadataResponse>(
+      `/groups/${groupJid}/metadata`
+    );
   }
 
   /**
@@ -518,11 +834,15 @@ export class Wasender {
    * @returns A promise that resolves to the list of group participants and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async getGroupParticipants(groupJid: string): Promise<GetGroupParticipantsResult> {
+  public async getGroupParticipants(
+    groupJid: string
+  ): Promise<GetGroupParticipantsResult> {
     if (!groupJid) {
       throw new WasenderAPIError("Group JID is required.", 400);
     }
-    return this.getInternal<GetGroupParticipantsResponse>(`/groups/${groupJid}/participants`);
+    return this.getInternal<GetGroupParticipantsResponse>(
+      `/groups/${groupJid}/participants`
+    );
   }
 
   /**
@@ -532,18 +852,24 @@ export class Wasender {
    * @returns A promise that resolves to the action status for each participant and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async addGroupParticipants(groupJid: string, participants: string[]): Promise<ModifyGroupParticipantsResult> {
+  public async addGroupParticipants(
+    groupJid: string,
+    participants: string[]
+  ): Promise<ModifyGroupParticipantsResult> {
     if (!groupJid) {
       throw new WasenderAPIError("Group JID is required.", 400);
     }
     if (!participants || participants.length === 0) {
-      throw new WasenderAPIError("Participants array cannot be null or empty.", 400);
+      throw new WasenderAPIError(
+        "Participants array cannot be null or empty.",
+        400
+      );
     }
     const payload: ModifyGroupParticipantsPayload = { participants };
-    return this.postInternal<ModifyGroupParticipantsPayload, ModifyGroupParticipantsResponse>(
-      `/groups/${groupJid}/participants/add`,
-      payload
-    );
+    return this.postInternal<
+      ModifyGroupParticipantsPayload,
+      ModifyGroupParticipantsResponse
+    >(`/groups/${groupJid}/participants/add`, payload);
   }
 
   /**
@@ -553,18 +879,24 @@ export class Wasender {
    * @returns A promise that resolves to the action status for each participant and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async removeGroupParticipants(groupJid: string, participants: string[]): Promise<ModifyGroupParticipantsResult> {
+  public async removeGroupParticipants(
+    groupJid: string,
+    participants: string[]
+  ): Promise<ModifyGroupParticipantsResult> {
     if (!groupJid) {
       throw new WasenderAPIError("Group JID is required.", 400);
     }
     if (!participants || participants.length === 0) {
-      throw new WasenderAPIError("Participants array cannot be null or empty.", 400);
+      throw new WasenderAPIError(
+        "Participants array cannot be null or empty.",
+        400
+      );
     }
     const payload: ModifyGroupParticipantsPayload = { participants };
-    return this.postInternal<ModifyGroupParticipantsPayload, ModifyGroupParticipantsResponse>(
-      `/groups/${groupJid}/participants/remove`,
-      payload
-    );
+    return this.postInternal<
+      ModifyGroupParticipantsPayload,
+      ModifyGroupParticipantsResponse
+    >(`/groups/${groupJid}/participants/remove`, payload);
   }
 
   /**
@@ -574,17 +906,20 @@ export class Wasender {
    * @returns A promise that resolves to the updated group settings information and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async updateGroupSettings(groupJid: string, settings: UpdateGroupSettingsPayload): Promise<UpdateGroupSettingsResult> {
+  public async updateGroupSettings(
+    groupJid: string,
+    settings: UpdateGroupSettingsPayload
+  ): Promise<UpdateGroupSettingsResult> {
     if (!groupJid) {
       throw new WasenderAPIError("Group JID is required.", 400);
     }
     if (Object.keys(settings).length === 0) {
-        throw new WasenderAPIError("Settings object cannot be empty.", 400);
+      throw new WasenderAPIError("Settings object cannot be empty.", 400);
     }
-    return this.putInternal<UpdateGroupSettingsPayload, UpdateGroupSettingsResponse>(
-      `/groups/${groupJid}/settings`,
-      settings
-    );
+    return this.putInternal<
+      UpdateGroupSettingsPayload,
+      UpdateGroupSettingsResponse
+    >(`/groups/${groupJid}/settings`, settings);
   }
 
   // ---------- Session Management Methods ----------
@@ -595,7 +930,9 @@ export class Wasender {
    * @throws WasenderAPIError if the request fails.
    */
   public async getAllWhatsAppSessions(): Promise<GetAllWhatsAppSessionsResult> {
-    return this.getInternal<GetAllWhatsAppSessionsResponse>("/whatsapp-sessions");
+    return this.getInternal<GetAllWhatsAppSessionsResponse>(
+      "/whatsapp-sessions"
+    );
   }
 
   /**
@@ -604,8 +941,160 @@ export class Wasender {
    * @returns A promise that resolves to the created session information and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async createWhatsAppSession(payload: CreateWhatsAppSessionPayload): Promise<CreateWhatsAppSessionResult> {
-    return this.postInternal<CreateWhatsAppSessionPayload, CreateWhatsAppSessionResponse>("/whatsapp-sessions", payload);
+  public async createWhatsAppSession(
+    payload: CreateWhatsAppSessionPayload
+  ): Promise<CreateWhatsAppSessionResult> {
+    return this.postInternal<
+      CreateWhatsAppSessionPayload,
+      CreateWhatsAppSessionResponse
+    >("/whatsapp-sessions", payload);
+  }
+
+  /**
+
+  /**
+   * Create a new group with a name and optional participants.
+   */
+  public async createGroup(name: string, participants?: string[]) {
+    if (!name || name.trim().length === 0)
+      throw new WasenderAPIError("Group name is required.", 400);
+    const payload: any = { name };
+    if (participants && participants.length > 0)
+      payload.participants = participants;
+    return this.postInternal<any, WasenderSuccessResponse>("/groups", payload);
+  }
+
+  /**
+   * Update group participants (promote/demote) using the dedicated endpoint.
+   */
+  public async updateGroupParticipants(
+    groupId: string,
+    action: "promote" | "demote",
+    participants: string[]
+  ) {
+    if (!groupId) throw new WasenderAPIError("groupId is required.", 400);
+    if (action !== "promote" && action !== "demote")
+      throw new WasenderAPIError(
+        "action must be either promote or demote.",
+        400
+      );
+    if (!participants || participants.length === 0)
+      throw new WasenderAPIError(
+        "participants array is required and cannot be empty.",
+        400
+      );
+    const payload = { action, participants };
+    return this.putInternal<any, WasenderSuccessResponse>(
+      `/groups/${groupId}/participants/update`,
+      payload
+    );
+  }
+
+  /**
+   * Leave a group.
+   */
+  public async leaveGroup(groupId: string) {
+    if (!groupId) throw new WasenderAPIError("groupId is required.", 400);
+    return this.postInternal<null, WasenderSuccessResponse>(
+      `/groups/${groupId}/leave`,
+      null
+    );
+  }
+
+  /**
+   * Accept a group invite by invite code.
+   */
+  public async acceptGroupInvite(code: string) {
+    if (!code) throw new WasenderAPIError("code is required.", 400);
+    return this.postInternal<{ code: string }, WasenderSuccessResponse>(
+      `/groups/invite/accept`,
+      { code }
+    );
+  }
+
+  /**
+   * Get group invite info for an invite code.
+   */
+  public async getGroupInviteInfo(inviteCode: string) {
+    if (!inviteCode) throw new WasenderAPIError("inviteCode is required.", 400);
+    return this.getInternal<WasenderSuccessResponse>(
+      `/groups/invite/${encodeURIComponent(inviteCode)}`
+    );
+  }
+
+  /**
+   * Get group invite link for a group JID.
+   */
+  public async getGroupInviteLink(groupJid: string) {
+    if (!groupJid) throw new WasenderAPIError("groupJid is required.", 400);
+    return this.getInternal<WasenderSuccessResponse>(
+      `/groups/${encodeURIComponent(groupJid)}/invite-link`
+    );
+  }
+
+  /**
+   * Get group profile picture URL.
+   */
+  public async getGroupProfilePicture(groupJid: string) {
+    if (!groupJid) throw new WasenderAPIError("groupJid is required.", 400);
+    return this.getInternal<WasenderSuccessResponse>(
+      `/groups/${encodeURIComponent(groupJid)}/picture`
+    );
+  }
+
+  // ---------- Media Handling ----------
+  /**
+   * Upload media file. Supports two modes:
+   *  - binary multipart/form-data (pass a FormData or Node-specific form object and set options.rawBody = true)
+   *  - JSON base64 upload: pass { base64, mimetype }
+   */
+  public async uploadMediaFile(
+    data: { base64?: string; mimetype?: string } | FormData,
+    useRawFormData = false
+  ) {
+    if (!data) throw new WasenderAPIError("upload data is required.", 400);
+    if (useRawFormData) {
+      // When passing FormData, we must call request with rawBody true and allow the caller to provide already-constructed body
+      // Note: Fetch in Node requires a proper FormData implementation; SDK user must supply correct fetchImpl and FormData when using this path.
+      const urlPath = "/upload";
+      const requestOptions = {
+        method: "POST" as const,
+        headers: {
+          // Authorization header is added in request helper, but when using raw FormData we must avoid setting Content-Type here
+        },
+      };
+      // Use the fetchImpl directly to allow streaming FormData; but we still need auth header applied — reuse request helper by calling request with rawBody and body as the FormData itself
+      // The request helper will skip JSON serialization when options.rawBody is true and will not override the body.
+      // @ts-ignore - allow sending FormData through our request helper
+      return this.request<any>("POST", urlPath, data as any, { rawBody: true });
+    } else {
+      // JSON base64 upload
+      const payload = data as { base64?: string; mimetype?: string };
+      if (!payload.base64)
+        throw new WasenderAPIError(
+          "base64 data is required for JSON upload.",
+          400
+        );
+      return this.postInternal<
+        { base64: string; mimetype?: string },
+        WasenderSuccessResponse
+      >("/upload", { base64: payload.base64, mimetype: payload.mimetype });
+    }
+  }
+
+  /**
+   * Decrypt media file using the message object provided by webhook/received message.
+   */
+  public async decryptMediaFile(messageObject: object) {
+    if (!messageObject)
+      throw new WasenderAPIError(
+        "messageObject is required to decrypt media.",
+        400
+      );
+    return this.postInternal<{ data: object }, WasenderSuccessResponse>(
+      "/decrypt-media",
+      { data: messageObject }
+    );
   }
 
   /**
@@ -614,9 +1103,13 @@ export class Wasender {
    * @returns A promise that resolves to the session details and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async getWhatsAppSessionDetails(sessionId: number): Promise<GetWhatsAppSessionDetailsResult> {
+  public async getWhatsAppSessionDetails(
+    sessionId: number
+  ): Promise<GetWhatsAppSessionDetailsResult> {
     if (!sessionId) throw new WasenderAPIError("Session ID is required.", 400);
-    return this.getInternal<GetWhatsAppSessionDetailsResponse>(`/whatsapp-sessions/${sessionId}`);
+    return this.getInternal<GetWhatsAppSessionDetailsResponse>(
+      `/whatsapp-sessions/${sessionId}`
+    );
   }
 
   /**
@@ -626,10 +1119,17 @@ export class Wasender {
    * @returns A promise that resolves to the updated session details and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async updateWhatsAppSession(sessionId: number, payload: UpdateWhatsAppSessionPayload): Promise<UpdateWhatsAppSessionResult> {
+  public async updateWhatsAppSession(
+    sessionId: number,
+    payload: UpdateWhatsAppSessionPayload
+  ): Promise<UpdateWhatsAppSessionResult> {
     if (!sessionId) throw new WasenderAPIError("Session ID is required.", 400);
-    if (Object.keys(payload).length === 0) throw new WasenderAPIError("Update payload cannot be empty.", 400);
-    return this.putInternal<UpdateWhatsAppSessionPayload, UpdateWhatsAppSessionResponse>(`/whatsapp-sessions/${sessionId}`, payload);
+    if (Object.keys(payload).length === 0)
+      throw new WasenderAPIError("Update payload cannot be empty.", 400);
+    return this.putInternal<
+      UpdateWhatsAppSessionPayload,
+      UpdateWhatsAppSessionResponse
+    >(`/whatsapp-sessions/${sessionId}`, payload);
   }
 
   /**
@@ -638,9 +1138,13 @@ export class Wasender {
    * @returns A promise that resolves to the deletion confirmation and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async deleteWhatsAppSession(sessionId: number): Promise<DeleteWhatsAppSessionResult> {
+  public async deleteWhatsAppSession(
+    sessionId: number
+  ): Promise<DeleteWhatsAppSessionResult> {
     if (!sessionId) throw new WasenderAPIError("Session ID is required.", 400);
-    return this.deleteInternal<DeleteWhatsAppSessionResponse>(`/whatsapp-sessions/${sessionId}`);
+    return this.deleteInternal<DeleteWhatsAppSessionResponse>(
+      `/whatsapp-sessions/${sessionId}`
+    );
   }
 
   /**
@@ -650,13 +1154,17 @@ export class Wasender {
    * @returns A promise that resolves to the connection status (e.g., QR code) and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async connectWhatsAppSession(sessionId: number, qrAsImage?: boolean): Promise<ConnectSessionResult> {
+  public async connectWhatsAppSession(
+    sessionId: number,
+    qrAsImage?: boolean
+  ): Promise<ConnectSessionResult> {
     if (!sessionId) throw new WasenderAPIError("Session ID is required.", 400);
-    const payload: ConnectSessionPayload | null = qrAsImage !== undefined ? { qr_as_image: qrAsImage } : null;
-    return this.postInternal<ConnectSessionPayload | null, ConnectSessionResponse>(
-        `/whatsapp-sessions/${sessionId}/connect`,
-        payload
-    );
+    const payload: ConnectSessionPayload | null =
+      qrAsImage !== undefined ? { qr_as_image: qrAsImage } : null;
+    return this.postInternal<
+      ConnectSessionPayload | null,
+      ConnectSessionResponse
+    >(`/whatsapp-sessions/${sessionId}/connect`, payload);
   }
 
   /**
@@ -665,9 +1173,13 @@ export class Wasender {
    * @returns A promise that resolves to the QR code data and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async getWhatsAppSessionQRCode(sessionId: number): Promise<GetQRCodeResult> {
+  public async getWhatsAppSessionQRCode(
+    sessionId: number
+  ): Promise<GetQRCodeResult> {
     if (!sessionId) throw new WasenderAPIError("Session ID is required.", 400);
-    return this.getInternal<GetQRCodeResponse>(`/whatsapp-sessions/${sessionId}/qrcode`);
+    return this.getInternal<GetQRCodeResponse>(
+      `/whatsapp-sessions/${sessionId}/qrcode`
+    );
   }
 
   /**
@@ -676,9 +1188,14 @@ export class Wasender {
    * @returns A promise that resolves to the disconnection status and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async disconnectWhatsAppSession(sessionId: number): Promise<DisconnectSessionResult> {
+  public async disconnectWhatsAppSession(
+    sessionId: number
+  ): Promise<DisconnectSessionResult> {
     if (!sessionId) throw new WasenderAPIError("Session ID is required.", 400);
-    return this.postInternal<null, DisconnectSessionResponse>(`/whatsapp-sessions/${sessionId}/disconnect`, null);
+    return this.postInternal<null, DisconnectSessionResponse>(
+      `/whatsapp-sessions/${sessionId}/disconnect`,
+      null
+    );
   }
 
   /**
@@ -688,12 +1205,18 @@ export class Wasender {
    * @returns A promise that resolves to the new API key and rate limit information.
    * @throws WasenderAPIError if the request fails.
    */
-  public async regenerateApiKey(sessionId: number): Promise<RegenerateApiKeyResult> {
+  public async regenerateApiKey(
+    sessionId: number
+  ): Promise<RegenerateApiKeyResult> {
     if (!sessionId) throw new WasenderAPIError("Session ID is required.", 400);
     // This request method will need special handling for the response type if it deviates significantly
     // from WasenderSuccessResponse, especially in error scenarios if they also don\'t fit WasenderErrorResponse.
     // For now, assuming success fits RegenerateApiKeyResponse and errors fit WasenderAPIError.
-    return this.request<RegenerateApiKeyResponse>("POST", `/whatsapp-sessions/${sessionId}/regenerate-key`, {});
+    return this.request<RegenerateApiKeyResponse>(
+      "POST",
+      `/whatsapp-sessions/${sessionId}/regenerate-key`,
+      {}
+    );
   }
 
   /**
@@ -708,7 +1231,10 @@ export class Wasender {
     // For now, we will assume `request` can handle it based on path or a new parameter.
     // The `GetSessionStatusResponse` is `{ status: "..." }`.
     // If rate limits are returned, `GetSessionStatusResult` includes `RateLimitInfo`.
-    const result = await this.request<GetSessionStatusResponse>("GET", "/status");
+    const result = await this.request<GetSessionStatusResponse>(
+      "GET",
+      "/status"
+    );
     return result as GetSessionStatusResult; // Casting, assuming rateLimitInfo is part of the raw result from request
   }
 
@@ -719,41 +1245,64 @@ export class Wasender {
    * @returns A promise that resolves to the parsed WasenderWebhookEvent.
    * @throws WasenderAPIError if the webhook secret is not configured in the SDK, if the signature is invalid, or if the body cannot be parsed.
    */
-  public async handleWebhookEvent(request: WebhookRequestAdapter): Promise<WasenderWebhookEvent> {
+  public async handleWebhookEvent(
+    request: WebhookRequestAdapter
+  ): Promise<WasenderWebhookEvent> {
     if (!this.configuredWebhookSecret) {
-      throw new WasenderAPIError("Webhook secret is not configured in the Wasender SDK instance. Cannot verify signature.");
+      throw new WasenderAPIError(
+        "Webhook secret is not configured in the Wasender SDK instance. Cannot verify signature."
+      );
     }
 
     const signature = request.getHeader(WEBHOOK_SIGNATURE_HEADER);
-    if (!verifyWasenderWebhookSignature(signature, this.configuredWebhookSecret)) {
+    if (
+      !verifyWasenderWebhookSignature(signature, this.configuredWebhookSecret)
+    ) {
       throw new WasenderAPIError("Invalid webhook signature.", 401); // Using 401 for unauthorized
     }
 
     let rawBody: string;
     try {
       const bodyPromiseOrString = request.getRawBody();
-      rawBody = typeof bodyPromiseOrString === 'string' ? bodyPromiseOrString : await bodyPromiseOrString;
+      rawBody =
+        typeof bodyPromiseOrString === "string"
+          ? bodyPromiseOrString
+          : await bodyPromiseOrString;
     } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-      throw new WasenderAPIError(`Failed to get raw body for webhook: ${message}`);
+      const message = err instanceof Error ? err.message : "Unknown error";
+      throw new WasenderAPIError(
+        `Failed to get raw body for webhook: ${message}`
+      );
     }
 
     try {
-      const parsedEvent = JSON.parse(rawBody) as WasenderWebhookEvent;
-      return parsedEvent;
+      const parsedRaw = JSON.parse(rawBody);
+      // Use dispatcher to convert to typed event or fallback preserving event name
+      const dispatched = dispatchWebhookEvent(parsedRaw);
+      return dispatched as WasenderWebhookEvent;
     } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-      throw new WasenderAPIError(`Failed to parse webhook JSON body: ${message}`);
+      const message = err instanceof Error ? err.message : "Unknown error";
+      throw new WasenderAPIError(
+        `Failed to parse webhook JSON body: ${message}`
+      );
     }
   }
 }
 
 // ---------- Example Helper Factory ----------
 export const createWasender = (
-    apiKey: string | undefined,
-    personalAccessToken?: string,
-    baseUrl?: string, 
-    fetchImplementation?: FetchImplementation,
-    retryOptions?: RetryConfig,
-    webhookSecret?: string 
-): Wasender => new Wasender(apiKey, personalAccessToken, baseUrl, fetchImplementation, retryOptions, webhookSecret);
+  apiKey: string | undefined,
+  personalAccessToken?: string,
+  baseUrl?: string,
+  fetchImplementation?: FetchImplementation,
+  retryOptions?: RetryConfig,
+  webhookSecret?: string
+): Wasender =>
+  new Wasender(
+    apiKey,
+    personalAccessToken,
+    baseUrl,
+    fetchImplementation,
+    retryOptions,
+    webhookSecret
+  );

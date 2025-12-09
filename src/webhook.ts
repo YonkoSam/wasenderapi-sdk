@@ -97,8 +97,14 @@ export interface BaseWebhookEvent<T extends WasenderWebhookEventType, D = any> {
 export interface MessageKey {
   id: string;
   fromMe: boolean;
-  remoteId: string; // Recipient ID for outgoing, Sender ID for incoming
+  remoteJid: string; // Recipient ID for outgoing, Sender ID for incoming
+  senderPn ?: string; // Push name of the sender
+  cleanSenderPn ?: string; // Cleaned push name of the sender
+  senderLid ?: string; // LID of the sender
   participant?: string; // For group messages, the ID of the actual sender
+  participantLid ?: string; // LID of the participant
+  participantPn ?: string; // Push name of the participant
+  cleanParticipantPn ?: string; // Cleaned push name of the participant
 }
 
 // ---------- Chat Event Payloads ----------
@@ -109,7 +115,6 @@ export interface ChatEntry {
   unreadCount?: number;
   muteEndTime?: number;
   isSpam?: boolean;
-  // ... other chat properties
 }
 
 export type ChatsUpsertEvent = BaseWebhookEvent<
@@ -125,18 +130,6 @@ export type ChatsDeleteEvent = BaseWebhookEvent<
   string[]
 >; // Array of chat IDs
 
-// ---------- Group Event Payloads ----------
-export interface GroupMetadata {
-  id: string;
-  subject: string;
-  creation?: number; // Unix timestamp
-  owner?: string; // ID of the group owner
-  desc?: string; // Group description
-  participants?: GroupParticipantObject[]; // Ensuring this uses GroupParticipantObject
-  announce?: boolean; // If true, only admins can send messages
-  restrict?: boolean; // If true, only admins can modify group info
-  // ... other group properties
-}
 
 export type GroupsUpsertEvent = BaseWebhookEvent<
   typeof WasenderWebhookEventType.GroupsUpsert,
@@ -147,7 +140,7 @@ export type GroupsUpdateEvent = BaseWebhookEvent<
   Partial<GroupMetadata>[]
 >; // Updates might be partial
 
-import { GroupParticipant as GroupParticipantObject } from "./groups.ts"; // This import is used by GroupMetadata now
+import {GroupMetadata, GroupParticipant, GroupParticipant as GroupParticipantObject} from "./groups.ts"; // This import is used by GroupMetadata now
 
 export interface GroupParticipantsUpdateData {
   id: string; // Group ID
@@ -159,15 +152,29 @@ export type GroupParticipantsUpdateEvent = BaseWebhookEvent<
   GroupParticipantsUpdateData
 >;
 
-// ---------- Contact Event Payloads ----------
 export interface ContactEntry {
-  id: string;
-  name?: string; // User's saved name for the contact
-  notify?: string; // Display name (often same as name or phone number)
-  verifiedName?: string; // Official business name if verified
-  status?: string; // Contact's WhatsApp status/about text
-  imgUrl?: string; // URL to profile picture (may be temporary)
-  // ... other contact properties
+  /** ID either in lid or jid format (preferred) **/
+  id: string
+  /** ID in LID format (@lid) **/
+  lid?: string
+  /** ID in PN format (@s.whatsapp.net)  **/
+  phoneNumber?: string
+  /** name of the contact, you have saved on your WA */
+  name?: string
+  /** name of the contact, the contact has set on their own on WA */
+  notify?: string
+  /** I have no idea */
+  verifiedName?: string
+  // Baileys Added
+  /**
+   * Url of the profile picture of the contact
+   *
+   * 'changed' => if the profile picture has changed
+   * null => if the profile picture has not been set (default profile picture)
+   * any other string => url of the profile picture
+   */
+  imgUrl?: string | null
+  status?: string
 }
 export type ContactsUpsertEvent = BaseWebhookEvent<
   typeof WasenderWebhookEventType.ContactsUpsert,
@@ -180,28 +187,36 @@ export type ContactsUpdateEvent = BaseWebhookEvent<
 
 // ---------- Message Event Payloads ----------
 export interface MessageContent {
-  conversation?: string; // For text messages
-  // Placeholders for other message types; expand based on actual API structure
+  conversation?: string; // Plain text message
+  extendedTextMessage?: {
+    text?: string;
+  }
+  messageBody?: string;
   imageMessage?: {
     url?: string;
     caption?: string;
     mimetype?: string /* ... */;
+    directPath?: string /* ... */;
   };
   videoMessage?: {
     url?: string;
     caption?: string;
     mimetype?: string /* ... */;
+    directPath?: string /* ... */;
   };
   documentMessage?: {
     url?: string;
     title?: string;
     mimetype?: string;
     fileName?: string /* ... */;
+    directPath?: string /* ... */;
+
   };
   audioMessage?: {
     url?: string;
     mimetype?: string;
     duration?: number /* ... */;
+    directPath?: string /* ... */;
   };
   stickerMessage?: { url?: string; mimetype?: string /* ... */ };
   contactMessage?: { displayName?: string; vcard?: string /* ... */ };
@@ -211,7 +226,7 @@ export interface MessageContent {
     name?: string;
     address?: string /* ... */;
   };
-  // ... add other message types like extendedTextMessage, buttonsMessage, templateMessage, etc.
+
 }
 
 export interface MessagesUpsertData {
@@ -219,7 +234,6 @@ export interface MessagesUpsertData {
   message?: MessageContent;
   pushName?: string; // Name of the user as set in their WhatsApp profile
   messageTimestamp?: number; // Unix timestamp of the message
-  // ... other properties related to a new message
 }
 export type MessagesUpsertEvent = BaseWebhookEvent<
   typeof WasenderWebhookEventType.MessagesUpsert,
